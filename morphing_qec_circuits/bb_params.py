@@ -1,8 +1,11 @@
 import numpy as np
+import stim
 from copy import deepcopy
 import galois  # for matrix calculations over a finite field
 from .morphing_specifications import MorphingSpecifications
 from .distance_functions import nkd_params
+from surface_sim.models import CircuitNoiseModel, NoiselessModel
+from .circuit_functions import qec_circuit_to_XZ_memory_experiment
 
 F2 = galois.GF(2)
 
@@ -640,6 +643,236 @@ class BBParams:
 
         return specifications
 
+    def get_logical_basis(self):
+        """
+        Note that this basis is not symplectic (not that it matters for my purposes though)
+        """
+        l = self.l
+        m = self.m
+        a_list = self.a_list
+        b_list = self.b_list
+        
+        x_matrix = F2(np.diag(np.ones((l - 1)), 1).astype(int))
+        x_matrix[l - 1, 0] = 1
+        y_matrix = F2(np.diag(np.ones((m - 1)), 1).astype(int))
+        y_matrix[m - 1, 0] = 1
+        amatrices = [
+            np.kron(
+                np.linalg.matrix_power(x_matrix, ael[0]),
+                np.linalg.matrix_power(y_matrix, ael[1]),
+            )
+            for ael in a_list
+        ]
+        bmatrices = [
+            np.kron(
+                np.linalg.matrix_power(x_matrix, bel[0]),
+                np.linalg.matrix_power(y_matrix, bel[1]),
+            )
+            for bel in b_list
+        ]
+        amatrix = F2(np.zeros((l * m, l * m)).astype(int))
+        bmatrix = F2(np.zeros((l * m, l * m)).astype(int))
+        for i in range(len(a_list)):
+            amatrix += amatrices[i]
+            bmatrix += bmatrices[i]
+        h = {
+            "X": np.concatenate((amatrix, bmatrix), axis=1),
+            "Z": np.concatenate((bmatrix.T, amatrix.T), axis=1),
+        }
+
+        stabilisers = {pauli: [] for pauli in ["X", "Z"]}
+        for i in range(l):
+            for j in range(m):
+                stabilisers["X"].append(np.nonzero(h["X"][m * i + j])[0].tolist())
+                stabilisers["Z"].append(np.nonzero(h["Z"][m * i + j])[0].tolist())
+
+        hker = {pauli: h[pauli].null_space() for pauli in ["X", "Z"]}
+        stabs_to_logicals = {pauli: h[pauli].row_reduce() for pauli in ["X", "Z"]}
+        observables = {pauli: [] for pauli in ["X", "Z"]}
+
+        for pauli in ["X", "Z"]:
+            other_pauli = "Z" if pauli == "X" else "X"
+            for i in range(hker[other_pauli].shape[0]):
+                new_vecs = np.concatenate(
+                    (stabs_to_logicals[pauli], [hker[other_pauli][i]]), axis=0
+                )
+                if np.linalg.matrix_rank(new_vecs) != np.linalg.matrix_rank(
+                    stabs_to_logicals[pauli]
+                ):
+                    stabs_to_logicals[pauli] = new_vecs
+                    observables[pauli].append(
+                        np.nonzero(hker[other_pauli][i])[0].tolist()
+                    )
+        return observables
+
+    def get_standard_XZ_memory_circuit(
+        self,
+        X_order,
+        Z_order,
+        noise_setup,
+        T,
+        noise_model_generator=lambda noise_setup, qubit_dictionary: CircuitNoiseModel(
+            noise_setup, qubit_dictionary
+        ),
+    ):
+        """
+        WARNING: This method does NOT currently check whether the order specified is PROPER (it does check parallelism)
+        
+        In future it would be nice to have this in an abstract StandardCircuitSpecifications class that mirrors my SuperdenseCircuitSpecifications one...
+            (so it would have in-built is_proper() and is_parallel() methods etc).
+        Compared to get_IBM_XZ_memory_circuit below, this method does NOT stagger the measurements, so e.g. the depth-9 BB circuit is NOT amortized.
+        Uses qec_circuit_to_XZ_memory_experiment from circuit_functions.py, which is just a copy I took on 28/08 of the same function that's living in
+            helper_functions.py from my IBM internship files.
+
+        X_order must be a list of strings "A0", "A1", "B0", etc, indicating which element from A or B each X ancilla interacts with in each time step.
+            If the X ancilla is not interacting with anything in that time step, then the corresponding element in the string can be either "" or None.
+        Z_order is the same, the inverse will be taken automatically.
+
+        X_order and Z_order should have the same length, and for each i such that X_order[i] != None != Z_order[i], we must have X_order[i][0] == Z_order[i][0].
+        """
+
+        l = self.l
+        m = self.m
+        a_list = self.a_list
+        b_list = self.b_list
+        ab_lists = {"A": a_list, "B": b_list}
+
+        if len(X_order) != len(Z_order):
+            raise ValueError("X_order and Z_order must have the same length!")
+
+        for i in range(len(X_order)):
+            if (not X_order[i] in ["", None]) and (not Z_order[i] in ["", None]):
+                if not X_order[i][0] == Z_order[i][0]:
+                    raise ValueError(f"X_order[{i}] and Z_order[{i}] are both non-trivial but have different matrix labels.")
+                if int(X_order[i][1]) >= len(ab_lists[X_order[i][0]]):
+                    raise ValueError(f"X_order[{i}] refers to an element {X_order[i]} that is out of the range of the {X_order[i][0]}-list.")
+                if int(Z_order[i][1]) >= len(ab_lists[Z_order[i][0]]):
+                    raise ValueError(f"Z_order[{i}] refers to an element {Z_order[i]} that is out of the range of the {Z_order[i][0]}-list.")
+                    
+        n_qubits = 4 * l * m
+
+        BB_coords_list = [
+            (label, i, j)
+            for label in ["L", "R", "X", "Z"]
+            for i in range(l)
+            for j in range(m)
+        ]
+
+        gate_lists = [[] for _ in range(len(X_order))]
+        measure_lists = {pauli: [] for pauli in ["X", "Z"]}
+        reset_lists = {pauli: [] for pauli in ["X", "Z"]}
+
+        for i in range(l):
+            for j in range(m):
+                x_ancilla = BB_coords_list.index(("X", i, j))
+                z_ancilla = BB_coords_list.index(("Z", i, j))
+
+                left_x_qubits = [
+                    BB_coords_list.index(("L", (ael[0] + i) % l, (ael[1] + j) % m))
+                    for ael in a_list
+                ]
+                right_x_qubits = [
+                    BB_coords_list.index(("R", (bel[0] + i) % l, (bel[1] + j) % m))
+                    for bel in b_list
+                ]
+                x_qubits = {"A": left_x_qubits, "B": right_x_qubits}
+                left_z_qubits = [
+                    BB_coords_list.index(("L", (-bel[0] + i) % l, (-bel[1] + j) % m))
+                    for bel in b_list
+                ]
+                right_z_qubits = [
+                    BB_coords_list.index(("R", (-ael[0] + i) % l, (-ael[1] + j) % m))
+                    for ael in a_list
+                ]
+                z_qubits = {"A": right_z_qubits, "B": left_z_qubits}
+
+                measure_lists["X"].append(x_ancilla)
+                reset_lists["X"].append(x_ancilla)
+                measure_lists["Z"].append(z_ancilla)
+                reset_lists["Z"].append(z_ancilla)
+
+                for k in range(len(X_order)):
+                    if not X_order[k] in ["", None]:
+                        gate_lists[k].append(x_ancilla)
+                        gate_lists[k].append(x_qubits[X_order[k][0]][int(X_order[k][1])])
+                    if not Z_order[k] in ["", None]:
+                        gate_lists[k].append(z_qubits[Z_order[k][0]][int(Z_order[k][1])])
+                        gate_lists[k].append(z_ancilla)
+
+        qec_circuit = stim.Circuit()
+        qec_circuit.append("RX", reset_lists["X"])
+        qec_circuit.append("RZ", reset_lists["Z"])
+        qec_circuit.append("TICK")
+        for i in range(len(gate_lists)):
+            qec_circuit.append("CNOT", gate_lists[i])
+            qec_circuit.append("TICK")
+        qec_circuit.append("MX", measure_lists["X"])
+        qec_circuit.append("MZ", measure_lists["Z"])
+        qec_circuit.append("TICK")
+
+        detector_circuit = stim.Circuit()
+        for i in range(2*l*m):
+            detector_circuit.append("DETECTOR", [stim.target_rec(-2*l*m+i), stim.target_rec(-4*l*m+i)])
+        
+
+        offsets = {"L": 0, "R": 1 + 1j, "X": 1, "Z": 1j}
+        Cartesian_coords_list = []
+        for i in range(n_qubits):
+            offset = offsets[BB_coords_list[i][0]]
+            Cartesian_coords_list.append(
+                round(2 * BB_coords_list[i][1] + np.real(offset))
+                + 1j * round(2 * BB_coords_list[i][2] + np.imag(offset))
+            )
+
+        #copy/paste of the coordinates part of the get_IBM_XZ_memory_circuit method below.
+
+        coordinate_circuit_str = ""
+
+        min_x = 0
+        max_x = 0
+        min_y = 0
+        max_y = 0
+        for i in range(len(Cartesian_coords_list)):
+            coord = Cartesian_coords_list[i]
+            min_x = min(round(coord.real), min_x)
+            max_x = max(round(coord.real), max_x)
+            min_y = min(round(coord.imag), min_y)
+            max_y = max(round(coord.imag), max_y)
+        for i in range(len(Cartesian_coords_list)):
+            coord = Cartesian_coords_list[i]
+            coordinate_circuit_str += f"QUBIT_COORDS({-min_x + round(coord.real)}, {(max_y - round(coord.imag))}) {i}\n"
+            # the minus makes sure y always is pointing up.
+            # Also should be such that all coords are always positive (to copy/paste into crumble if necessary)
+
+        coordinate_circuit = stim.Circuit(coordinate_circuit_str)
+
+        observables = self.get_logical_basis()
+        logical_operator_basis = {pauli: [] for pauli in ["X", "Z"]}
+        zs = np.zeros(4*l*m, dtype = np.bool_)
+        for i in range(len(observables["X"])):
+            xs = np.zeros(4*l*m, dtype = np.bool_)
+            for j in observables["X"][i]:
+                xs[j] = 1
+            logical_operator_basis["X"].append(stim.PauliString.from_numpy(xs = xs, zs = zs))
+        xs = np.zeros(4*l*m, dtype = np.bool_)
+        for i in range(len(observables["Z"])):
+            zs = np.zeros(4*l*m, dtype = np.bool_)
+            for j in observables["Z"][i]:
+                zs[j] = 1
+            logical_operator_basis["Z"].append(stim.PauliString.from_numpy(xs = xs, zs = zs))
+
+        return qec_circuit_to_XZ_memory_experiment(
+            qec_circuit,
+            coordinate_circuit,
+            detector_circuit,
+            logical_operator_basis,
+            noise_setup,
+            T,
+            noise_model_generator=lambda noise_setup, qubit_dictionary: CircuitNoiseModel(
+                noise_setup, qubit_dictionary
+                ),
+            )
+
     def get_IBM_XZ_memory_circuit(
         self,
         noise_setup,
@@ -650,6 +883,8 @@ class BBParams:
     ):
         """
         a bit messier than the other functions since it very closely follows my old code. But seems to work.
+        Compared to the more general get_standard_XZ_memory_circuit above, this method DOES stagger the measurements so that the extra depth of the BB code
+            circuit is amortized throughout the memory experiment.
         """
 
         l = self.l
@@ -767,7 +1002,7 @@ class BBParams:
         hker = {pauli: h[pauli].null_space() for pauli in ["X", "Z"]}
         stabs_to_logicals = {pauli: h[pauli].row_reduce() for pauli in ["X", "Z"]}
         observables = {pauli: [] for pauli in ["X", "Z"]}
-
+        
         for pauli in ["X", "Z"]:
             other_pauli = "Z" if pauli == "X" else "X"
             for i in range(hker[other_pauli].shape[0]):
@@ -804,7 +1039,29 @@ class BBParams:
                 + 1j * round(2 * coords_list[i][2] + np.imag(offset))
             )
 
-        circ = coordinate_circuit(coordinates_list, n_extra_qubits=n_logicals)
+        #copy/paste of the coordinates_circuit function from morphing_specifications.py
+
+        circuit_str = ""
+
+        min_x = 0
+        max_x = 0
+        min_y = 0
+        max_y = 0
+        for i in range(len(coordinates_list)):
+            coord = coordinates_list[i]
+            min_x = min(round(coord.real), min_x)
+            max_x = max(round(coord.real), max_x)
+            min_y = min(round(coord.imag), min_y)
+            max_y = max(round(coord.imag), max_y)
+        for i in range(len(coordinates_list)):
+            coord = coordinates_list[i]
+            circuit_str += f"QUBIT_COORDS({-min_x + round(coord.real)}, {(max_y - round(coord.imag))}) {i}\n"
+            # the minus makes sure y always is pointing up.
+            # Also should be such that all coords are always positive (to copy/paste into crumble if necessary)
+        for j in range(n_logicals):
+            circuit_str += f"QUBIT_COORDS({-min_x + max_x + 1 + (j // (-min_y+max_y+1))}, {-min_y + max_y - (j % (-min_y+max_y+1))}) {len(coordinates_list) + j}\n"
+
+        circ = stim.Circuit(circuit_str)
 
         # prepare an error-free Bell state between each logical qubit and each perfect dummy qubit
 
@@ -838,9 +1095,9 @@ class BBParams:
         circ += noise_model.idle(
             [str(i) for i in range(4 * l * m) if str(i) not in reset_lists["Z"][0]]
         )
+        circ += noise_model.tick()
 
         for i in [1, 2, 3, 4, 5, 6, 7, 0]:
-            circ += tick
             circ += noise_model.cnot(gate_lists[i])
             circ += noise_model.measure_x(measure_lists["X"][i])
             circ += noise_model.measure(measure_lists["Z"][i])
@@ -860,6 +1117,7 @@ class BBParams:
                     )
                 ]
             )
+            circ += noise_model.tick()
         for i in range(l * m):
             circ.append(
                 "DETECTOR",
@@ -876,7 +1134,6 @@ class BBParams:
         if T > 2:
             repeat_circ = stim.Circuit()
             for i in [1, 2, 3, 4, 5, 6, 7, 0]:
-                repeat_circ += tick
                 repeat_circ += noise_model.cnot(gate_lists[i])
                 repeat_circ += noise_model.measure_x(measure_lists["X"][i])
                 repeat_circ += noise_model.measure(measure_lists["Z"][i])
@@ -896,6 +1153,7 @@ class BBParams:
                         )
                     ]
                 )
+                repeat_circ += noise_model.tick()
             for i in range(l * m):
                 repeat_circ.append(
                     "DETECTOR",
@@ -911,7 +1169,6 @@ class BBParams:
             circ += repeat_circ * (T - 2)
 
         for i in [1, 2, 3, 4, 5, 6, 7]:
-            circ += tick
             circ += noise_model.cnot(gate_lists[i])
             circ += noise_model.measure_x(measure_lists["X"][i])
             circ += noise_model.measure(measure_lists["Z"][i])
@@ -931,14 +1188,15 @@ class BBParams:
                     )
                 ]
             )
+            circ += noise_model.tick()
 
         # no idling noise in this round to transition to the noise-free Bell measurements
-        circ += tick
         circ += noise_model.cnot(gate_lists[0])
         circ += noise_model.measure_x(measure_lists["X"][0])
         circ += noise_model.measure(measure_lists["Z"][0])
         circ += noise_model.reset_x(reset_lists["X"][0])
         circ += noise_model.reset(reset_lists["Z"][0])
+        circ += tick
 
         for i in range(l * m):
             circ.append(
@@ -968,7 +1226,6 @@ class BBParams:
             )
 
         # perfect measurement of the observables
-        circ += tick
         for i in range(n_logicals):
             for qubit in observables["X"][i]:
                 circ += noiseless_model.cnot([str(n_qubits + i), str(qubit)])

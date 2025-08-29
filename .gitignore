@@ -1,15 +1,15 @@
 # files I don't want to copy
-bp_osd
-Data_collection_notebook
-For_cluster
-General_nonsense
-old_mle_decoder
-test_output
+bp_osd.py
+Data_collection_notebook.ipynb
+For_cluster.ipynb
+General_nonsense.ipynb
+old_mle_decoder.py
+test_output.txt
 morphing_qec_circuits/.ipynb_checkpoints/
 morphing_qec_circuits/__pycache__/
-morphing_qec_circuits/Abelian_2BGA_params
-morphing_qec_circuits/colour_code_specifications
-morphing_qec_circuits/library
+morphing_qec_circuits/Abelian_2BGA_params.py
+morphing_qec_circuits/colour_code_specifications.py
+morphing_qec_circuits/library.py
 
 
 # Byte-compiled / optimized / DLL files

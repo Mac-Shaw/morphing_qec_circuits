@@ -452,6 +452,8 @@ class MorphingSpecifications:
             for qubit in self.end_cycle_logicals["X"][0][i]:
                 circ += noiseless_model.cnot([str(n_qubits + i), str(qubit)])
 
+        circ += tick
+        
         for i in range(1, n_rounds):
             circ += self.morphing_QEC_round(noiseless_model, i - 1 / 2)
             circ += observable_circuits[i]
@@ -522,7 +524,7 @@ class MorphingSpecifications:
         ),
     ):
         """
-        
+        Currently not compatible with the SI1000 noise model (doesn't remove idling noise in the first and last rounds)
         """
         n_qubits = self.n_qubits()
         n_logicals = self.n_logicals()
@@ -541,7 +543,6 @@ class MorphingSpecifications:
 
         qubit_dictionary = {str(i): i for i in range(n_qubits)}
         noise_model = noise_model_generator(noise_setup, qubit_dictionary)
-        tick = noise_model.tick()
 
         detector_circuits_i = self.initial_memory_detector_circuits(basis)
         detector_circuits = self.mid_experiment_detector_circuits()
@@ -555,6 +556,8 @@ class MorphingSpecifications:
             circ += noise_model.reset_z([str(i) for i in range(n_qubits)])
         else:
             raise ValueError("basis needs to be X or Z!")
+
+        circ += noise_model.tick()
         
         # Run T cycles
 
@@ -614,7 +617,6 @@ class MorphingSpecifications:
         circ += detector_circuits[final_round]
         circ += observable_circuits[final_round]
         
-        circ += tick
         if basis == "X":
             circ += noise_model.measure_x([str(i) for i in range(n_qubits)])
         elif basis == "Z":
@@ -666,7 +668,6 @@ class MorphingSpecifications:
 
         qubit_dictionary = {str(i): i for i in range(n_qubits)}
         noise_model = noise_model_generator(noise_setup, qubit_dictionary)
-        tick = noise_model.tick()
 
         detector_circuits_i = self.initial_stability_detector_circuits()
         detector_circuits = self.mid_experiment_detector_circuits()
@@ -675,6 +676,8 @@ class MorphingSpecifications:
         circ = self.coordinate_circuit(n_extra_qubits=0)
 
         circ += noise_model.reset_y([str(i) for i in range(n_qubits)])
+
+        circ += noise_model.tick()
 
         # first (n_rounds - 1) rounds need to use initial detectors (not mid-circuit detectors)
         # first (n_rounds - 1) rounds have observables
@@ -700,8 +703,64 @@ class MorphingSpecifications:
         for i in range(n_left_over_rounds):
             circ += self.morphing_QEC_round(noise_model, i - 1 / 2)
             circ += detector_circuits[i]
+        
+        circ += noise_model.measure_y([str(i) for i in range(n_qubits)])
+        return circ
 
-        circ += tick
+    def get_morphing_XZ_stability_circuit_XYZ_permutation(
+        self,
+        noise_setup,
+        T,
+        noise_model_generator=lambda noise_setup, qubit_dictionary: CircuitNoiseModel(
+            noise_setup, qubit_dictionary
+        ),
+    ):
+        """
+        Only supported for self-dual codes (i.e. their X and Z stabilisers coincide), so that HS^dag is a transversal gate.
+        Only supported for codes whose contracting and expanding stabilisers swap under this HS^dag transversal gate.
+            (So it has to really only have two contraction rounds.)
+        In other words, this is intended for use on any of the hex-grid colour code morphing circuits (not square grid).
+        In principle though it should also work for self-dual BB8 codes.
+        """
+
+        n_qubits = self.n_qubits()
+        n_redundancies = self.n_redundancies()
+        #n_rounds = self.n_rounds()
+        n_stabilisers = self.n_stabilisers()
+        n_layers = len(self.gate_lists[0])
+
+        if T < 1:
+            raise ValueError("T is too smol for the mol, make him bigger")
+
+        self.compile_all(check_compiled=True)
+
+        # The circuit starts in the end-cycle code \tilde{C}_{-1} and finishes in the end-cycle code \tilde{C}_{T}
+        # The circuit starts with the expanding gates of c_round -1, then the contracting gates of c_round 0.
+        # The contraction gates of final_round will just have been completed at the end of the circuit.
+
+        qubit_dictionary = {str(i): i for i in range(n_qubits)}
+        noise_model = noise_model_generator(noise_setup, qubit_dictionary)
+
+        detector_circuit = self.detector_circuit_XYZ_permutation()
+        observable_circuits = self.initial_redundancy_observable_circuits()# redundancies are still redundancies even if there is a logical gate!
+
+        circ = self.coordinate_circuit(n_extra_qubits=0)
+
+        circ += noise_model.reset_y([str(i) for i in range(n_qubits)])
+
+        circ += noise_model.tick()
+        
+        circ += self.morphing_QEC_round_XYZ_permutation(noise_model)
+        circ += observable_circuits[0]
+
+        n_repeats = T - 1
+
+        repeated_circ = stim.Circuit()
+        repeated_circ += self.morphing_QEC_round_XYZ_permutation(noise_model)
+        repeated_circ += detector_circuit
+
+        circ += repeated_circ * n_repeats
+        
         circ += noise_model.measure_y([str(i) for i in range(n_qubits)])
         return circ
 
@@ -738,11 +797,9 @@ class MorphingSpecifications:
         """
         n_qubits = self.n_qubits()
         n_rounds = self.n_rounds()
-        tick = noise_model.tick()
         previous_round = round(QEC_round - 1 / 2) % n_rounds
         following_round = round(QEC_round + 1 / 2) % n_rounds
         circ = stim.Circuit()
-        circ += tick
         reset_lists = {}
         for pauli in ["X", "Z"]:
             reset_lists[pauli] = self.measurement_lists[pauli][previous_round]
@@ -754,7 +811,7 @@ class MorphingSpecifications:
         circ += noise_model.reset_x([str(i) for i in reset_lists["X"]])
         circ += noise_model.reset_z([str(i) for i in reset_lists["Z"]])
         circ += noise_model.idle([str(i) for i in reset_lists["idle"]])
-        circ += tick
+        circ += noise_model.tick()
         expanding_gates = self.gate_lists[previous_round]
         for j in range(len(expanding_gates) - 1, -1, -1):
             cnot_list = [i for gate in expanding_gates[j] for i in gate]
@@ -762,7 +819,7 @@ class MorphingSpecifications:
             circ += noise_model.idle(
                 [str(i) for i in range(n_qubits) if not (i in cnot_list)]
             )
-            circ += tick
+            circ += noise_model.tick()
         contracting_gates = self.gate_lists[following_round]
         for j in range(len(contracting_gates)):
             cnot_list = [i for gate in contracting_gates[j] for i in gate]
@@ -770,7 +827,7 @@ class MorphingSpecifications:
             circ += noise_model.idle(
                 [str(i) for i in range(n_qubits) if not (i in cnot_list)]
             )
-            circ += tick
+            circ += noise_model.tick()
         meas_lists = {}
         for pauli in ["X", "Z"]:
             meas_lists[pauli] = self.measurement_lists[pauli][following_round]
@@ -782,6 +839,64 @@ class MorphingSpecifications:
         circ += noise_model.measure_x([str(i) for i in meas_lists["X"]])
         circ += noise_model.measure_z([str(i) for i in meas_lists["Z"]])
         circ += noise_model.idle([str(i) for i in meas_lists["idle"]])
+        circ += noise_model.tick()
+        return circ
+
+    def morphing_QEC_round_XYZ_permutation(self, noise_model):
+        """
+        Only one circuit because of the assumptions of the HS^dag transversal gate.
+        """
+        n_qubits = self.n_qubits()
+        n_rounds = self.n_rounds()
+        previous_round = 0
+        following_round = 0
+        circ = stim.Circuit()
+        reset_lists = {}
+        for pauli in ["X", "Z"]:
+            reset_lists[pauli] = self.measurement_lists[pauli][previous_round]
+        reset_lists["idle"] = [
+            i
+            for i in range(n_qubits)
+            if (not i in reset_lists["X"]) and (not i in reset_lists["Z"])
+        ]
+        circ += noise_model.reset_x([str(i) for i in reset_lists["X"]])
+        circ += noise_model.reset_z([str(i) for i in reset_lists["Z"]])
+        circ += noise_model.idle([str(i) for i in reset_lists["idle"]])
+        circ += noise_model.tick()
+        expanding_gates = self.gate_lists[previous_round]
+        for j in range(len(expanding_gates) - 1, -1, -1):
+            cnot_list = [i for gate in expanding_gates[j] for i in gate]
+            circ += noise_model.cnot([str(i) for i in cnot_list])
+            circ += noise_model.idle(
+                [str(i) for i in range(n_qubits) if not (i in cnot_list)]
+            )
+            circ += noise_model.tick()
+        
+        circ += noise_model.s_dag_gate([str(i) for i in range(n_qubits)])
+        circ += noise_model.tick()
+        circ += noise_model.hadamard([str(i) for i in range(n_qubits)])
+        circ += noise_model.tick()
+        
+        contracting_gates = self.gate_lists[following_round]
+        for j in range(len(contracting_gates)):
+            cnot_list = [i for gate in contracting_gates[j] for i in gate]
+            circ += noise_model.cnot([str(i) for i in cnot_list])
+            circ += noise_model.idle(
+                [str(i) for i in range(n_qubits) if not (i in cnot_list)]
+            )
+            circ += noise_model.tick()
+        meas_lists = {}
+        for pauli in ["X", "Z"]:
+            meas_lists[pauli] = self.measurement_lists[pauli][following_round]
+        meas_lists["idle"] = [
+            i
+            for i in range(n_qubits)
+            if (not i in meas_lists["X"]) and (not i in meas_lists["Z"])
+        ]
+        circ += noise_model.measure_x([str(i) for i in meas_lists["X"]])
+        circ += noise_model.measure_z([str(i) for i in meas_lists["Z"]])
+        circ += noise_model.idle([str(i) for i in meas_lists["idle"]])
+        circ += noise_model.tick()
         return circ
 
     def mid_experiment_detector_circuits(self):
@@ -834,6 +949,58 @@ class MorphingSpecifications:
                         "DETECTOR", rec_targets, detector_annotation
                     )
         return detector_circuits
+
+    def detector_circuit_XYZ_permutation(self):
+        """
+        For use in the stability experiments with the XYZ permutation. There's only one circuit, since the same contraction circuit is applied each time.
+        """
+        n_rounds = self.n_rounds()
+        detector_circuit = stim.Circuit()
+        #The assumptions of the permutation stability experiment are stringent enough that this function is quite simple compared to the general mid-experiment detector circuit.
+        #Things are most convenient if we first construct the self-duality of the code.
+        X_to_Z = {}
+        Z_to_X = {}
+        for i in range(len(self.mid_cycle_stabilisers["X"])):
+            for j in range(len(self.mid_cycle_stabilisers["Z"])):
+                if np.all([el in self.mid_cycle_stabilisers["Z"][j] for el in self.mid_cycle_stabilisers["X"][i]]):
+                    if np.all([el in self.mid_cycle_stabilisers["X"][i] for el in self.mid_cycle_stabilisers["Z"][j]]):
+                        X_to_Z[i] = j
+                        Z_to_X[j] = i
+        #See iPad notes 15/06/2025
+        for i in range(len(self.mid_cycle_stabilisers["X"])):
+            if self.stabiliser_contraction_rounds["X"][i] == [0]:
+                rec_targets = []
+                offset = len(self.measurement_lists["Z"][0]) + len(self.measurement_lists["X"][0])
+                rec_targets += [stim.target_rec(l - offset) for l in self.stabiliser_measurement_indices["X"][0][i]]
+                offset += len(self.measurement_lists["Z"][0])
+                rec_targets += [stim.target_rec(l - offset) for l in self.stabiliser_measurement_indices["Z"][0][X_to_Z[i]]]
+                offset += len(self.measurement_lists["X"][0])
+                rec_targets += [stim.target_rec(l - offset) for l in self.stabiliser_measurement_indices["X"][0][i]]
+                if self.stabiliser_annotations == {}:
+                    detector_annotation = (0, 0, 0, 0)
+                else:
+                    detector_annotation = self.stabiliser_annotations["X"][i]
+                detector_circuit.append(
+                    "DETECTOR", rec_targets, detector_annotation
+                )
+
+        
+        for i in range(len(self.mid_cycle_stabilisers["Z"])):
+            if self.stabiliser_contraction_rounds["Z"][i] == [0]:
+                rec_targets = []
+                offset = len(self.measurement_lists["Z"][0])
+                rec_targets += [stim.target_rec(l - offset) for l in self.stabiliser_measurement_indices["Z"][0][i]]
+                offset += len(2*self.measurement_lists["X"][0] + self.measurement_lists["Z"][0])
+                rec_targets += [stim.target_rec(l - offset) for l in self.stabiliser_measurement_indices["X"][0][Z_to_X[i]]]
+                if self.stabiliser_annotations == {}:
+                    detector_annotation = (0, 0, 0, 3)
+                else:
+                    detector_annotation = self.stabiliser_annotations["Z"][i]
+                detector_circuit.append(
+                    "DETECTOR", rec_targets, detector_annotation
+                )
+
+        return detector_circuit
 
     def initial_memory_detector_circuits(self, basis):
         """
